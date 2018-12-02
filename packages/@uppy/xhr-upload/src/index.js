@@ -48,6 +48,8 @@ module.exports = class XHRUpload extends Plugin {
       limit: 0,
       withCredentials: false,
       responseType: '',
+      useWorker: false,
+      WorkerConstructor: null,
       /**
        * @typedef respObj
        * @property {string} responseText
@@ -190,112 +192,224 @@ module.exports = class XHRUpload extends Plugin {
     const opts = this.getOptions(file)
 
     this.uppy.log(`uploading ${current} of ${total}`)
+    const id = cuid()
+
     return new Promise((resolve, reject) => {
-      const data = opts.formData
-        ? this.createFormDataUpload(file, opts)
-        : this.createBareUpload(file, opts)
+      if (this.opts.useWorker) {
+        const worker = new this.opts.WorkerConstructor()
+        const {
+          responseUrlFieldName,
+          formData,
+          respondeType,
+          method,
+          endpoint,
+          withCredentials,
+          headers,
+          metaFields,
+          fieldName
+        } = this.opts
 
-      const timer = this.createProgressTimeout(opts.timeout, (error) => {
-        xhr.abort()
-        this.uppy.emit('upload-error', file, error)
-        reject(error)
-      })
+        worker.postMessage({
+          type: 'uppy/UPLOAD_START',
+          id,
+          file: {
+            data: file.data,
+            meta: file.meta
+          },
+          opts: {
+            responseUrlFieldName,
+            formData,
+            respondeType,
+            method,
+            endpoint,
+            withCredentials,
+            headers,
+            metaFields,
+            fieldName,
+            getResponseData: URL.createObjectURL(new Blob([this.opts.getResponseData])),
+            getResponseError: URL.createObjectURL(new Blob([this.opts.getResponseError]))
+          }
+        })
 
-      const xhr = new XMLHttpRequest()
-      if (opts.responseType !== '') {
-        xhr.responseType = opts.responseType
-      }
+        const listener = (ev) => {
+          if (ev.data.id !== id) {
+            return
+          }
+          const data = ev.data
+          switch (data.type) {
+            case 'uppy/UPLOAD_STARTED':
+              this.uppy.log(`[XHRUpload] ${data.id} started`)
+              break
+            case 'uppy/UPLOAD_ERROR':
+              this.uppy.emit('upload-error', file, data.error)
+              if (data.response) {
+                this.uppy.setFileState(file.id, { reponse: data.response })
+              }
+              worker.removeEventListener('message', listener)
+              reject(data.error)
+              break
+            case 'uppy/UPLOAD_PROGRESS':
+              this.uppy.log(
+                `[XHRUpload] ${data.id} progress: ${data.ev.loaded} / ${data.ev.total}`)
+              if (data.ev.lengthComputable) {
+                this.uppy.emit('upload-progress', file, {
+                  uploader: this,
+                  bytesUploaded: data.ev.loaded,
+                  bytesTotal: data.ev.total
+                })
+              }
+              break
+            case 'uppy/UPLOAD_FINISHED':
+              const id = ev.data.id
+              this.uppy.log(`[XHRUpload] ${id} finished`)
+              break
+            case 'uppy/UPLOAD_SUCCESS':
+              this.uppy.setFileState(file.id, { response: data.response })
+              this.uppy.emit(
+                'upload-success',
+                file,
+                data.response.body,
+                data.response.uploadURL
+              )
 
-      const id = cuid()
-
-      xhr.upload.addEventListener('loadstart', (ev) => {
-        this.uppy.log(`[XHRUpload] ${id} started`)
-        // Begin checking for timeouts when loading starts.
-        timer.progress()
-      })
-
-      xhr.upload.addEventListener('progress', (ev) => {
-        this.uppy.log(`[XHRUpload] ${id} progress: ${ev.loaded} / ${ev.total}`)
-        timer.progress()
-
-        if (ev.lengthComputable) {
-          this.uppy.emit('upload-progress', file, {
-            uploader: this,
-            bytesUploaded: ev.loaded,
-            bytesTotal: ev.total
-          })
+              if (data.response.uploadURL) {
+                this.uppy.log(`Download ${file.name} from ${file.uploadURL}`)
+              }
+              worker.removeEventListener('message', listener)
+              resolve(file)
+              break
+            case 'uppy/TIMER_DONE':
+              this.uppy.log(`[XHRUpload] timer done`)
+              break
+            default:
+              this.uppy.log(`[XHRUpload] unknown message from worker: ${ev.data.type}`)
+          }
         }
-      })
 
-      xhr.addEventListener('load', (ev) => {
-        this.uppy.log(`[XHRUpload] ${id} finished`)
-        timer.done()
+        worker.addEventListener('message', listener)
 
-        if (ev.target.status >= 200 && ev.target.status < 300) {
-          const body = opts.getResponseData(xhr.responseText, xhr)
-          const uploadURL = body[opts.responseUrlFieldName]
-
-          const response = {
-            status: ev.target.status,
-            body,
-            uploadURL
+        this.uppy.on('file-removed', (removedFile) => {
+          if (removedFile.id === file.id) {
+            worker.postMessage({
+              type: 'uppy/UPLOAD_ABORT',
+              id
+            })
+            worker.removeEventListener('message', listener)
           }
+        })
 
-          this.uppy.setFileState(file.id, { response })
+        this.uppy.on('cancel-all', () => {
+          worker.postMessage({
+            type: 'uppy/UPLOAD_ABORT',
+            id
+          })
+          worker.removeEventListener('message', listener)
+        })
+      } else {
+        const data = opts.formData
+          ? this.createFormDataUpload(file, opts)
+          : this.createBareUpload(file, opts)
 
-          this.uppy.emit('upload-success', file, body, uploadURL)
+        const xhr = new XMLHttpRequest()
+        if (opts.responseType !== '') {
+          xhr.responseType = opts.responseType
+        }
 
-          if (uploadURL) {
-            this.uppy.log(`Download ${file.name} from ${file.uploadURL}`)
+        const timer = this.createProgressTimeout(opts.timeout, (error) => {
+          xhr.abort()
+          this.uppy.emit('upload-error', file, error)
+          reject(error)
+        })
+
+        xhr.upload.addEventListener('loadstart', (ev) => {
+          this.uppy.log(`[XHRUpload] ${id} started`)
+          // Begin checking for timeouts when loading starts.
+          timer.progress()
+        })
+
+        xhr.upload.addEventListener('progress', (ev) => {
+          this.uppy.log(`[XHRUpload] ${id} progress: ${ev.loaded} / ${ev.total}`)
+          timer.progress()
+
+          if (ev.lengthComputable) {
+            this.uppy.emit('upload-progress', file, {
+              uploader: this,
+              bytesUploaded: ev.loaded,
+              bytesTotal: ev.total
+            })
           }
+        })
 
-          return resolve(file)
-        } else {
-          const body = opts.getResponseData(xhr.responseText, xhr)
+        xhr.addEventListener('load', (ev) => {
+          this.uppy.log(`[XHRUpload] ${id} finished`)
+          timer.done()
+
+          if (ev.target.status >= 200 && ev.target.status < 300) {
+            const body = opts.getResponseData(xhr.responseText, xhr)
+            const uploadURL = body[opts.responseUrlFieldName]
+
+            const response = {
+              status: ev.target.status,
+              body,
+              uploadURL
+            }
+
+            this.uppy.setFileState(file.id, { response })
+
+            this.uppy.emit('upload-success', file, body, uploadURL)
+
+            if (uploadURL) {
+              this.uppy.log(`Download ${file.name} from ${file.uploadURL}`)
+            }
+
+            return resolve(file)
+          } else {
+            const body = opts.getResponseData(xhr.responseText, xhr)
+            const error = buildResponseError(xhr, opts.getResponseError(xhr.responseText, xhr))
+
+            const response = {
+              status: ev.target.status,
+              body
+            }
+
+            this.uppy.setFileState(file.id, { response })
+
+            this.uppy.emit('upload-error', file, error)
+            return reject(error)
+          }
+        })
+
+        xhr.addEventListener('error', (ev) => {
+          this.uppy.log(`[XHRUpload] ${id} errored`)
+          timer.done()
+
           const error = buildResponseError(xhr, opts.getResponseError(xhr.responseText, xhr))
-
-          const response = {
-            status: ev.target.status,
-            body
-          }
-
-          this.uppy.setFileState(file.id, { response })
-
           this.uppy.emit('upload-error', file, error)
           return reject(error)
-        }
-      })
+        })
 
-      xhr.addEventListener('error', (ev) => {
-        this.uppy.log(`[XHRUpload] ${id} errored`)
-        timer.done()
+        xhr.open(opts.method.toUpperCase(), opts.endpoint, true)
+        // IE10 does not allow setting `withCredentials` before `open()` is called.
+        xhr.withCredentials = opts.withCredentials
 
-        const error = buildResponseError(xhr, opts.getResponseError(xhr.responseText, xhr))
-        this.uppy.emit('upload-error', file, error)
-        return reject(error)
-      })
+        Object.keys(opts.headers).forEach((header) => {
+          xhr.setRequestHeader(header, opts.headers[header])
+        })
 
-      xhr.open(opts.method.toUpperCase(), opts.endpoint, true)
-      // IE10 does not allow setting `withCredentials` before `open()` is called.
-      xhr.withCredentials = opts.withCredentials
+        xhr.send(data)
 
-      Object.keys(opts.headers).forEach((header) => {
-        xhr.setRequestHeader(header, opts.headers[header])
-      })
+        this.uppy.on('file-removed', (removedFile) => {
+          if (removedFile.id === file.id) {
+            timer.done()
+            xhr.abort()
+          }
+        })
 
-      xhr.send(data)
-
-      this.uppy.on('file-removed', (removedFile) => {
-        if (removedFile.id === file.id) {
+        this.uppy.on('cancel-all', () => {
           timer.done()
           xhr.abort()
-        }
-      })
-
-      this.uppy.on('cancel-all', () => {
-        timer.done()
-        xhr.abort()
-      })
+        })
+      }
     })
   }
 
