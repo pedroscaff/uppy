@@ -6,20 +6,7 @@ const emitSocketProgress = require('@uppy/utils/lib/emitSocketProgress')
 const getSocketHost = require('@uppy/utils/lib/getSocketHost')
 const settle = require('@uppy/utils/lib/settle')
 const limitPromises = require('@uppy/utils/lib/limitPromises')
-
-function buildResponseError (xhr, error) {
-  // No error message
-  if (!error) error = new Error('Upload error')
-  // Got an error message string
-  if (typeof error === 'string') error = new Error(error)
-  // Got something else
-  if (!(error instanceof Error)) {
-    error = Object.assign(new Error('Upload error'), { data: error })
-  }
-
-  error.request = xhr
-  return error
-}
+const { createRequest, buildResponseError } = require('./upload')
 
 module.exports = class XHRUpload extends Plugin {
   constructor (uppy, opts) {
@@ -36,6 +23,7 @@ module.exports = class XHRUpload extends Plugin {
 
     // Default options
     const defaultOptions = {
+      id: 'XHRUpload',
       formData: true,
       fieldName: 'files[]',
       method: 'post',
@@ -82,6 +70,7 @@ module.exports = class XHRUpload extends Plugin {
 
     // Merge default options with the ones set by user
     this.opts = Object.assign({}, defaultOptions, opts)
+    this.id = this.opts.id
 
     // i18n
     this.translator = new Translator([ defaultLocale, this.uppy.locale, this.opts.locale ])
@@ -306,14 +295,7 @@ module.exports = class XHRUpload extends Plugin {
           worker.removeEventListener('message', listener)
         })
       } else {
-        const data = opts.formData
-          ? this.createFormDataUpload(file, opts)
-          : this.createBareUpload(file, opts)
-
-        const xhr = new XMLHttpRequest()
-        if (opts.responseType !== '') {
-          xhr.responseType = opts.responseType
-        }
+        const { xhr, data } = createRequest(file, opts)
 
         const timer = this.createProgressTimeout(opts.timeout, (error) => {
           xhr.abort()
@@ -386,14 +368,6 @@ module.exports = class XHRUpload extends Plugin {
           const error = buildResponseError(xhr, opts.getResponseError(xhr.responseText, xhr))
           this.uppy.emit('upload-error', file, error)
           return reject(error)
-        })
-
-        xhr.open(opts.method.toUpperCase(), opts.endpoint, true)
-        // IE10 does not allow setting `withCredentials` before `open()` is called.
-        xhr.withCredentials = opts.withCredentials
-
-        Object.keys(opts.headers).forEach((header) => {
-          xhr.setRequestHeader(header, opts.headers[header])
         })
 
         xhr.send(data)
